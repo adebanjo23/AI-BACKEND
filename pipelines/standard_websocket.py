@@ -1,5 +1,5 @@
+# pipelines/standard_websocket.py
 import io
-import json
 import asyncio
 import re
 import string
@@ -12,11 +12,31 @@ class StandardWebSocketPipeline(BasePipeline):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.finish_event = asyncio.Event()
+        self.message_history = []
+        self.max_history = 5  # Keep last 10 messages by default
 
     def should_end_conversation(self, text: str) -> bool:
         text = text.translate(str.maketrans('', '', string.punctuation))
         text = text.strip().lower()
         return re.search(r'\b(goodbye|bye)\b$', text) is not None
+
+    def add_to_history(self, role: str, content: str):
+        self.message_history.append({"role": role, "content": content})
+        # Keep only the last N messages
+        if len(self.message_history) > self.max_history:
+            self.message_history = self.message_history[-self.max_history:]
+
+    def get_messages_for_llm(self, user_input: str):
+        # System prompt stays the same
+        messages = [{"role": "system", "content": self.prompts.current_template.system_prompt}]
+
+        # Add historical context
+        messages.extend(self.message_history)
+
+        # Add current user input
+        messages.append({"role": "user", "content": user_input})
+
+        return messages
 
     async def handle_audio_stream(self, websocket: WebSocket):
         try:
@@ -36,21 +56,22 @@ class StandardWebSocketPipeline(BasePipeline):
 
                 # Process final transcripts for AI response
                 if transcript['type'] == 'speech_final':
-                    if self.should_end_conversation(transcript['content']):
+                    user_input = transcript['content']
+
+                    if self.should_end_conversation(user_input):
                         self.finish_event.set()
                         await websocket.send_json({'type': 'finish'})
                         break
 
-                    # Generate AI response
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": "You are a helpful and enthusiastic assistant. Speak in a human, conversational tone. Keep your answers as short and concise as possible, like in a conversation, ideally no more than 120 characters."
-                        },
-                        {"role": "user", "content": transcript['content']}
-                    ]
+                    # Add user message to history
+                    self.add_to_history("user", user_input)
 
+                    # Generate AI response with context
+                    messages = self.get_messages_for_llm(user_input)
                     response = await self.llm.generate_response(messages)
+
+                    # Add assistant response to history
+                    self.add_to_history("assistant", response)
 
                     # Send text response
                     await websocket.send_json({
